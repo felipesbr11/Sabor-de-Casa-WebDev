@@ -1,1 +1,0 @@
-# Sem dependências externas: o serviço usa só a biblioteca padrão do Python 3.
