@@ -8,14 +8,15 @@ Só usa a biblioteca padrão do Python 3 (http.server + sqlite3).
   python3 server.py             # depois
   abra http://localhost:8000
 """
-import argparse, json, math, re, sqlite3, unicodedata, mimetypes
+import argparse, json, math, os, re, sqlite3, unicodedata, mimetypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 BASE = Path(__file__).parent
-DB = BASE / "cardapio.db"
+DB = Path(os.environ.get("DB_PATH", BASE / "cardapio.db"))  # DB_PATH: ex. disco persistente
 PUBLIC = BASE / "public"
+MAX_BODY = 64 * 1024  # bytes
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS categoria(
@@ -141,14 +142,20 @@ def validar_prato(body, conn, base=None):
     preco = dados.get("preco")
     if isinstance(preco, bool) or not isinstance(preco, (int, float)) or not math.isfinite(preco):
         erros["preco"] = "Informe o preço."
-    elif round(preco * 100) <= 0:
+    elif preco <= 0:
         erros["preco"] = "O preço deve ser maior que zero."
+    elif abs(preco * 100 - round(preco * 100)) > 1e-6:
+        erros["preco"] = "Use no máximo duas casas decimais (por exemplo, 22,50)."
+    elif preco > 9999.99:
+        erros["preco"] = "O preço deve ser no máximo R$ 9.999,99."
     cat_id = dados.get("categoria_id")
     if isinstance(cat_id, bool) or not isinstance(cat_id, int) or not conn.execute(
             "SELECT 1 FROM categoria WHERE id = ?", (cat_id,)).fetchone():
         erros["categoria_id"] = "Escolha a categoria do prato."
     desc = dados.get("descricao")
     desc = " ".join(desc.split()) if isinstance(desc, str) else ""
+    if len(desc) > 200:
+        erros["descricao"] = "A descrição pode ter no máximo 200 caracteres."
     if not isinstance(dados.get("disponivel"), bool):
         erros["disponivel"] = "Use true ou false."
     if erros:
@@ -159,8 +166,10 @@ def validar_prato(body, conn, base=None):
 def prato_listar(conn, query, **_):
     sql, args = SQL_PRATO, []
     if "categoria_id" in query:
+        if not query["categoria_id"][0].isdigit():
+            raise ApiError(400, "O filtro categoria_id deve ser um número.")
         sql += " WHERE categoria_id = ?"
-        args.append(query["categoria_id"][0])
+        args.append(int(query["categoria_id"][0]))
     return 200, [prato_out(r) for r in conn.execute(sql + " ORDER BY nome COLLATE NOCASE", args)]
 
 
@@ -210,7 +219,15 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(dados)
 
     def ler_json(self):
-        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if n < 0:
+            raise ApiError(400, "Requisição inválida: tamanho do corpo incorreto.")
+        if n > MAX_BODY:
+            self.close_connection = True
+            raise ApiError(413, "Os dados enviados são grandes demais.")
         try:
             body = json.loads(self.rfile.read(n) or b"{}")
         except ValueError:
@@ -237,6 +254,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with conn:
                 return acao(conn=conn, id_=id_, body=body, query=query)
+        except sqlite3.IntegrityError:
+            raise ApiError(409, "Não foi possível salvar: outra alteração entrou em conflito com esta. "
+                                "Atualize a página e tente de novo.")
         finally:
             conn.close()
 
@@ -286,12 +306,14 @@ def semear():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8000)))
+    ap.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0" if os.environ.get("PORT") else "127.0.0.1"),
+                    help="127.0.0.1 = só este computador; 0.0.0.0 = acessível pela rede")
     ap.add_argument("--seed", action="store_true", help="cria dados de exemplo se o banco estiver vazio")
     args = ap.parse_args()
     with conectar() as c:
         c.executescript(SCHEMA)
     if args.seed:
         semear()
-    print(f"Sabor de Casa rodando em http://localhost:{args.port}")
-    ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+    print(f"Sabor de Casa rodando em http://{args.host}:{args.port}")
+    ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
